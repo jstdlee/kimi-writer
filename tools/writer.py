@@ -24,12 +24,19 @@ def write_file_impl(filename: str, content: str, mode: Literal["create", "append
     if not project_folder:
         return "Error: No active project folder. Please create a project first using create_project."
     
+    if (not filename or os.path.basename(filename) != filename
+            or "/" in filename or "\\" in filename or ".." in filename):
+        return f"Error: Invalid filename '{filename}'. Use a plain file name without path separators or '..'."
+
     # Ensure filename ends with .md
     if not filename.endswith('.md'):
         filename = filename + '.md'
     
     # Create full file path
     file_path = os.path.join(project_folder, filename)
+    root = os.path.realpath(project_folder)
+    if os.path.commonpath([root, os.path.realpath(file_path)]) != root:
+        return f"Error: '{filename}' resolves outside the project folder."
     
     try:
         if mode == "create":
