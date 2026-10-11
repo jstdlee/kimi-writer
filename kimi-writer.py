@@ -24,6 +24,8 @@ from utils import (
     get_system_prompt
 )
 from tools.compression import compress_context_impl
+from tools.dispatch import execute_tool_calls, fill_dangling_tool_calls
+from tools.project import set_active_project_folder
 
 
 # Constants
@@ -54,7 +56,7 @@ def load_context_from_file(file_path: str) -> str:
         sys.exit(1)
 
 
-def get_user_input() -> tuple[str, bool]:
+def get_user_input() -> tuple[str, bool, str | None]:
     """
     Gets user input from command line, either as a prompt or recovery file.
     
@@ -90,11 +92,11 @@ Examples:
     # Check if recovery mode
     if args.recover:
         context = load_context_from_file(args.recover)
-        return context, True
+        return context, True, args.recover
     
     # Check if prompt provided as argument
     if args.prompt:
-        return args.prompt, False
+        return args.prompt, False, None
     
     # Interactive prompt
     print("=" * 60)
@@ -113,7 +115,7 @@ Examples:
         print("Error: Empty prompt. Please provide a writing request.")
         sys.exit(1)
     
-    return prompt, False
+    return prompt, False, None
 
 
 def convert_message_for_api(msg: Any) -> Dict[str, Any]:
@@ -194,7 +196,7 @@ def main():
     )
     
     # Get user input
-    user_prompt, is_recovery = get_user_input()
+    user_prompt, is_recovery, recover_path = get_user_input()
     
     # Initialize message history
     messages = [
@@ -202,6 +204,11 @@ def main():
     ]
     
     if is_recovery:
+        # Summary files live in the project folder: restore it as active
+        project_dir = os.path.dirname(os.path.abspath(recover_path))
+        if os.path.basename(recover_path).startswith(".context_summary_") and os.path.isdir(project_dir):
+            set_active_project_folder(project_dir)
+            print(f"✓ Active project folder: {project_dir}")
         messages.append({
             "role": "user",
             "content": f"[RECOVERED CONTEXT]\n\n{user_prompt}\n\n[END RECOVERED CONTEXT]\n\nPlease continue the work from where we left off."
@@ -227,6 +234,9 @@ def main():
     print(f"Auto-compression at: {COMPRESSION_THRESHOLD:,} tokens")
     print("=" * 60 + "\n")
     
+    force_compress = False
+    task_completed = False
+
     # Main agent loop
     for iteration in range(1, MAX_ITERATIONS + 1):
         print(f"\n{'─' * 60}")
@@ -239,7 +249,8 @@ def main():
             print(f"📊 Current tokens: {token_count:,}/{TOKEN_LIMIT:,} ({token_count/TOKEN_LIMIT*100:.1f}%)")
             
             # Trigger compression if approaching limit
-            if token_count >= COMPRESSION_THRESHOLD:
+            if token_count >= COMPRESSION_THRESHOLD or force_compress:
+                force_compress = False
                 print(f"\n⚠️  Approaching token limit! Compressing context...")
                 compression_result = compress_context_impl(
                     messages=messages,
@@ -269,7 +280,7 @@ def main():
                     messages=messages,
                     client=client,
                     model=MODEL_NAME,
-                    keep_recent=len(messages)  # Keep all messages, just save summary
+                    save_only=True
                 )
                 if compression_result.get("summary_file"):
                     print(f"✓ Backup saved: {os.path.basename(compression_result['summary_file'])}\n")
@@ -388,101 +399,39 @@ def main():
                 print("\n✓ Tool call complete")
                 print("─" * 60 + "\n")
             
-            # Reconstruct the message object from accumulated data
-            class ReconstructedMessage:
-                def __init__(self):
-                    self.role = role or "assistant"
-                    self.content = content_text if content_text else None
-                    self.reasoning_content = reasoning_content if reasoning_content else None
-                    self.tool_calls = None
-                    
-                    if tool_calls_data:
-                        # Convert to proper format
-                        from openai.types.chat import ChatCompletionMessageToolCall
-                        from openai.types.chat.chat_completion_message_tool_call import Function
-                        
-                        self.tool_calls = []
-                        for tc in tool_calls_data:
-                            if tc["id"]:  # Only add if we have an ID
-                                tool_call = type('ToolCall', (), {
-                                    'id': tc["id"],
-                                    'type': 'function',
-                                    'function': type('Function', (), {
-                                        'name': tc["function"]["name"],
-                                        'arguments': tc["function"]["arguments"]
-                                    })()
-                                })()
-                                self.tool_calls.append(tool_call)
-            
-            message = ReconstructedMessage()
-            
-            # Convert message to dict and add to history
-            # Important: preserve the full message object structure
-            messages.append(convert_message_for_api(message))
-            
-            # Check if the model called any tools
-            if not message.tool_calls:
+            # Build the assistant message (dict) from accumulated data
+            tool_calls = [
+                {"id": tc["id"], "type": "function",
+                 "function": {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]}}
+                for tc in tool_calls_data if tc["id"]
+            ]
+            assistant_msg = {"role": role or "assistant"}
+            if content_text:
+                assistant_msg["content"] = content_text
+            if reasoning_content:
+                assistant_msg["reasoning_content"] = reasoning_content
+            if tool_calls:
+                assistant_msg["tool_calls"] = tool_calls
+            messages.append(assistant_msg)
+
+            if not tool_calls:
+                if finish_reason == "length":
+                    print("⚠️  Response truncated by token limit. Asking the model to continue in smaller parts.")
+                    messages.append({"role": "user", "content": "Your last response was cut off by the output limit. Continue, in smaller steps."})
+                    continue
                 print("=" * 60)
                 print("✅ TASK COMPLETED")
                 print("=" * 60)
                 print(f"Completed in {iteration} iteration(s)")
                 print("=" * 60)
+                task_completed = True
                 break
-            
-            # Handle tool calls
-            print(f"\n🔧 Model decided to call {len(message.tool_calls)} tool(s):")
-            
-            for tool_call in message.tool_calls:
-                func_name = tool_call.function.name
-                args_str = tool_call.function.arguments
-                
-                try:
-                    args = json.loads(args_str)
-                except json.JSONDecodeError:
-                    args = {}
-                
-                print(f"\n  → {func_name}")
-                print(f"    Arguments: {json.dumps(args, ensure_ascii=False, indent=6)}")
-                
-                # Get the tool implementation
-                tool_func = tool_map.get(func_name)
-                
-                if not tool_func:
-                    result = f"Error: Unknown tool '{func_name}'"
-                    print(f"    ✗ {result}")
-                else:
-                    # Special handling for compress_context (needs extra params)
-                    if func_name == "compress_context":
-                        result_data = compress_context_impl(
-                            messages=messages,
-                            client=client,
-                            model=MODEL_NAME,
-                            keep_recent=10
-                        )
-                        result = result_data.get("message", "Compression completed")
-                        
-                        # Update messages with compressed version
-                        if "compressed_messages" in result_data:
-                            messages = result_data["compressed_messages"]
-                    else:
-                        # Call the tool with its arguments
-                        result = tool_func(**args)
-                    
-                    # Print result (truncate if too long)
-                    if len(str(result)) > 200:
-                        print(f"    ✓ {str(result)[:200]}...")
-                    else:
-                        print(f"    ✓ {result}")
-                
-                # Add tool result to messages
-                tool_message = {
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "name": func_name,
-                    "content": str(result)
-                }
-                messages.append(tool_message)
-        
+
+            print(f"\n🔧 Model decided to call {len(tool_calls)} tool(s):")
+            flags = execute_tool_calls(tool_calls, finish_reason, messages, tool_map)
+            if flags["compress_requested"]:
+                force_compress = True
+
         except KeyboardInterrupt:
             print("\n\n⚠️  Interrupted by user. Saving context...")
             # Save current context before exiting
@@ -491,7 +440,7 @@ def main():
                     messages=messages,
                     client=client,
                     model=MODEL_NAME,
-                    keep_recent=len(messages)
+                    save_only=True
                 )
                 if compression_result.get("summary_file"):
                     print(f"✓ Context saved to: {compression_result['summary_file']}")
@@ -504,10 +453,11 @@ def main():
         except Exception as e:
             print(f"\n✗ Error during iteration {iteration}: {e}")
             print(f"Attempting to continue...\n")
+            fill_dangling_tool_calls(messages, f"error: {e}")
             continue
     
-    # If we hit max iterations
-    if iteration >= MAX_ITERATIONS:
+    # If we hit max iterations without finishing
+    if not task_completed:
         print("\n" + "=" * 60)
         print("⚠️  MAX ITERATIONS REACHED")
         print("=" * 60)
@@ -519,7 +469,7 @@ def main():
                 messages=messages,
                 client=client,
                 model=MODEL_NAME,
-                keep_recent=len(messages)
+                save_only=True
             )
             if compression_result.get("summary_file"):
                 print(f"✓ Context saved to: {compression_result['summary_file']}")
