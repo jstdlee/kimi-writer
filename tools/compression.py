@@ -9,11 +9,55 @@ from typing import List, Dict, Any
 from .project import get_active_project_folder
 
 
+SUMMARY_MAX_TOKENS = 16384
+FALLBACK_CHARS = 20000
+TOOL_RESULT_LIMIT = 1000
+
+
+def _build_conversation_text(msgs: List[Dict[str, Any]]) -> str:
+    """Render messages (dicts) as text for the summarizer."""
+    out = ""
+    for msg in msgs:
+        role = msg.get("role", "unknown")
+        content = msg.get("content") or ""
+        if role == "assistant":
+            reasoning = msg.get("reasoning_content")
+            if reasoning:
+                out += f"\n[Assistant Reasoning]: {reasoning[:500]}...\n"
+            infos = []
+            for tc in msg.get("tool_calls") or []:
+                fn = tc.get("function", {})
+                name = fn.get("name", "?")
+                raw = fn.get("arguments", "")
+                if name == "write_file":
+                    try:
+                        a = json.loads(raw)
+                        infos.append(f"write_file(file={a.get('filename')}, mode={a.get('mode')}, chars={len(a.get('content', ''))})")
+                        continue
+                    except (json.JSONDecodeError, AttributeError):
+                        pass
+                infos.append(f"{name}({raw[:500]})")
+            if infos:
+                out += f"\n[Assistant Tool Calls]: {', '.join(infos)}\n"
+            if content:
+                out += f"\n[Assistant]: {content}\n"
+        elif role == "tool":
+            name = msg.get("name", "unknown_tool")
+            text = str(content)
+            if len(text) > TOOL_RESULT_LIMIT and not text.startswith("Error"):
+                text = text[:700] + " [...] " + text[-300:]
+            out += f"\n[Tool Result - {name}]: {text}\n"
+        elif role == "user":
+            out += f"\n[User]: {content}\n"
+    return out
+
+
 def compress_context_impl(
     messages: List[Any],
     client,
     model: str,
-    keep_recent: int = 10
+    keep_recent: int = 10,
+    save_only: bool = False
 ) -> Dict[str, Any]:
     """
     Compresses the conversation context by summarizing older messages.
@@ -29,6 +73,7 @@ def compress_context_impl(
         client: The OpenAI client instance
         model: The model to use for summarization
         keep_recent: Number of recent messages to keep uncompressed
+        save_only: Write the summary file but keep all messages unchanged
         
     Returns:
         Dictionary containing:
@@ -37,24 +82,35 @@ def compress_context_impl(
         - tokens_before: Estimated tokens before compression
         - tokens_after: Estimated tokens after compression
     """
-    if len(messages) <= keep_recent + 1:  # +1 for system message
+    system_message = messages[0] if messages and messages[0].get("role") == "system" else None
+    start = 1 if system_message else 0
+
+    if save_only:
+        cut = len(messages)
+    else:
+        cut = len(messages) - keep_recent
+        # Never start the recent block with a 'tool' message: snap back to the
+        # assistant message that issued the tool calls.
+        while cut > start and messages[cut].get("role") == "tool":
+            cut -= 1
+        if cut <= start:
+            return {
+                "compressed_messages": messages,
+                "summary_file": None,
+                "tokens_saved": 0,
+                "message": "Not enough messages to compress."
+            }
+
+    messages_to_compress = messages[start:cut]
+    recent_messages = messages[cut:]
+    if not messages_to_compress:
         return {
             "compressed_messages": messages,
             "summary_file": None,
             "tokens_saved": 0,
             "message": "Not enough messages to compress."
         }
-    
-    # Separate system message, messages to compress, and recent messages
-    system_message = messages[0] if messages and messages[0].get("role") == "system" else None
-    
-    if system_message:
-        messages_to_compress = messages[1:-keep_recent]
-        recent_messages = messages[-keep_recent:]
-    else:
-        messages_to_compress = messages[:-keep_recent]
-        recent_messages = messages[-keep_recent:]
-    
+
     # Create a detailed prompt for summarization
     summary_prompt = """Please provide a comprehensive summary of the conversation history below. Include:
 1. The main task or goal discussed
@@ -66,40 +122,9 @@ def compress_context_impl(
 Conversation history to summarize:
 """
     
-    # Build the conversation text
-    conversation_text = ""
-    for msg in messages_to_compress:
-        role = msg.get("role", "unknown")
-        content = msg.get("content", "")
-        
-        # Handle different message types
-        if role == "assistant":
-            # Check for reasoning_content
-            if hasattr(msg, "reasoning_content"):
-                reasoning = getattr(msg, "reasoning_content")
-                if reasoning:
-                    conversation_text += f"\n[Assistant Reasoning]: {reasoning[:500]}...\n"
-            
-            # Check for tool calls
-            if hasattr(msg, "tool_calls") and msg.tool_calls:
-                tool_calls_info = []
-                for tc in msg.tool_calls:
-                    func_name = tc.function.name
-                    args = tc.function.arguments
-                    tool_calls_info.append(f"{func_name}({args})")
-                conversation_text += f"\n[Assistant Tool Calls]: {', '.join(tool_calls_info)}\n"
-            
-            if content:
-                conversation_text += f"\n[Assistant]: {content}\n"
-        
-        elif role == "tool":
-            tool_name = msg.get("name", "unknown_tool")
-            conversation_text += f"\n[Tool Result - {tool_name}]: {content[:200]}...\n"
-        
-        elif role == "user":
-            conversation_text += f"\n[User]: {content}\n"
-    
-    # Call the API to get summary
+    conversation_text = _build_conversation_text(messages_to_compress)
+
+    summary = None
     try:
         summary_response = client.chat.completions.create(
             model=model,
@@ -108,19 +133,23 @@ Conversation history to summarize:
                 {"role": "user", "content": summary_prompt + conversation_text}
             ],
             temperature=0.7,
-            max_tokens=4096
+            max_tokens=SUMMARY_MAX_TOKENS
         )
-        
         summary = summary_response.choices[0].message.content
-        
     except Exception as e:
-        return {
-            "compressed_messages": messages,
-            "summary_file": None,
-            "tokens_saved": 0,
-            "message": f"Error during compression: {str(e)}"
-        }
-    
+        if not save_only:
+            return {
+                "compressed_messages": messages,
+                "summary_file": None,
+                "tokens_saved": 0,
+                "message": f"Error during compression: {str(e)}"
+            }
+
+    if not summary or not summary.strip():
+        # Reasoning can eat max_tokens and leave content empty: fall back to
+        # the raw digest so progress is never lost.
+        summary = "(Automatic summary unavailable; raw history digest follows.)\n\n" + conversation_text[-FALLBACK_CHARS:]
+
     # Save summary to file
     project_folder = get_active_project_folder()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -136,12 +165,20 @@ Conversation history to summarize:
             f.write(f"# Context Summary\n\n")
             f.write(f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
             f.write(f"**Messages Compressed:** {len(messages_to_compress)}\n\n")
-            f.write(f"**Messages Retained:** {keep_recent}\n\n")
+            f.write(f"**Messages Retained:** {len(recent_messages)}\n\n")
             f.write(f"---\n\n")
             f.write(summary)
     except Exception as e:
         summary_file = f"Error saving summary: {str(e)}"
     
+    if save_only:
+        return {
+            "compressed_messages": messages,
+            "summary_file": summary_file,
+            "tokens_saved": 0,
+            "message": f"Summary saved to {os.path.basename(summary_file)}."
+        }
+
     # Build the compressed message list
     compressed_messages = []
     
@@ -168,7 +205,7 @@ Conversation history to summarize:
         "summary_file": summary_file,
         "tokens_saved": estimated_tokens_saved,
         "messages_compressed": len(messages_to_compress),
-        "messages_retained": keep_recent,
+        "messages_retained": len(recent_messages),
         "message": f"Successfully compressed {len(messages_to_compress)} messages. Summary saved to {os.path.basename(summary_file)}."
     }
 
