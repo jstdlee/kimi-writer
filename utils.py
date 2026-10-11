@@ -7,14 +7,22 @@ import httpx
 from typing import List, Dict, Any, Callable
 
 
+def rough_token_estimate(messages: List[Dict]) -> int:
+    """
+    Offline fallback when the token endpoint fails: ~1 token per 3 characters
+    (deliberately high, so compression starts early rather than late).
+    """
+    return len(json.dumps(messages, ensure_ascii=False, default=str)) // 3
+
+
 def estimate_token_count(base_url: str, api_key: str, model: str, messages: List[Dict]) -> int:
     """
     Estimate the token count for the given messages using the Moonshot API.
     
-    Note: Token estimation uses api.moonshot.ai (not .cn)
+    The request goes to the same base URL as the chat API.
     
     Args:
-        base_url: The base URL for the API (will be converted to .ai for token endpoint)
+        base_url: The base URL for the API
         api_key: The API key for authentication
         model: The model name
         messages: List of message dictionaries
@@ -48,7 +56,6 @@ def estimate_token_count(base_url: str, api_key: str, model: str, messages: List
             
         serializable_messages.append(clean_msg)
     
-    # Both token estimation and chat use api.moonshot.ai
     token_base_url = base_url
     
     # Make the API call

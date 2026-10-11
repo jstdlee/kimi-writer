@@ -110,6 +110,14 @@ The agent has access to three tools:
 - **Auto-Compression**: Triggers at 180,000 tokens (90% of limit)
 - **Backups**: Automatic context summaries every 50 iterations
 - **Recovery**: All summaries saved with timestamps for resumption
+- **Token count**: Uses the Moonshot estimate endpoint; falls back to a rough local estimate if it fails
+- **Errors**: After 5 failed API calls in a row the agent stops (with backoff) and tells you to use `--recover`
+
+## Tests
+
+```bash
+uv run --with pytest --with-requirements requirements.txt pytest
+```
 
 ## Project Structure
 
@@ -120,7 +128,9 @@ kimi-writer/
 │   ├── __init__.py       # Tool registry
 │   ├── writer.py         # File writing tool
 │   ├── project.py        # Project management tool
+│   ├── dispatch.py       # Tool-call execution (always replies to every call)
 │   └── compression.py    # Context compression tool
+├── tests/                # pytest tests (mocked client, no API key needed)
 ├── utils.py              # Utilities (token counting, etc.)
 ├── requirements.txt      # Python dependencies
 ├── env.example           # Example configuration

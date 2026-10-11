@@ -54,6 +54,19 @@ def set_active_project_folder(folder_path: str) -> None:
     _active_project_folder = folder_path
 
 
+def get_output_dir() -> str:
+    """Returns the absolute path of the 'output' directory next to kimi-writer.py."""
+    root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(root_dir, "output")
+
+
+def is_project_folder(path: str) -> bool:
+    """True if path is an existing project folder directly inside output/."""
+    return (os.path.isdir(path)
+            and os.path.realpath(os.path.dirname(os.path.abspath(path)))
+            == os.path.realpath(get_output_dir()))
+
+
 def create_project_impl(project_name: str) -> str:
     """
     Creates a new project folder in the output directory.
@@ -69,12 +82,8 @@ def create_project_impl(project_name: str) -> str:
     # Sanitize the folder name
     sanitized_name = sanitize_folder_name(project_name)
     
-    # Get the script's root directory (where kimi-writer.py is located)
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    root_dir = os.path.dirname(script_dir)  # Go up from tools/ to root
-    
-    # Create output directory if it doesn't exist
-    output_dir = os.path.join(root_dir, "output")
+    # Output directory next to kimi-writer.py
+    output_dir = get_output_dir()
     if not os.path.exists(output_dir):
         try:
             os.makedirs(output_dir, exist_ok=True)

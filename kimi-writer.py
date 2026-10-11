@@ -9,6 +9,7 @@ and short story collections based on user prompts.
 import os
 import sys
 import json
+import time
 import argparse
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -19,13 +20,14 @@ load_dotenv()
 
 from utils import (
     estimate_token_count, 
+    rough_token_estimate,
     get_tool_definitions, 
     get_tool_map,
     get_system_prompt
 )
 from tools.compression import compress_context_impl
 from tools.dispatch import execute_tool_calls, fill_dangling_tool_calls
-from tools.project import set_active_project_folder
+from tools.project import set_active_project_folder, is_project_folder
 
 
 # Constants
@@ -34,6 +36,7 @@ TOKEN_LIMIT = 200000
 COMPRESSION_THRESHOLD = 180000  # Trigger compression at 90% of limit
 MODEL_NAME = "kimi-k2-thinking"
 BACKUP_INTERVAL = 50  # Save backup summary every N iterations
+MAX_CONSECUTIVE_ERRORS = 5  # Stop after this many failed API calls in a row
 
 
 def load_context_from_file(file_path: str) -> str:
@@ -56,13 +59,8 @@ def load_context_from_file(file_path: str) -> str:
         sys.exit(1)
 
 
-def get_user_input() -> tuple[str, bool, str | None]:
-    """
-    Gets user input from command line, either as a prompt or recovery file.
-    
-    Returns:
-        Tuple of (prompt/context, is_recovery_mode)
-    """
+def parse_args(argv=None):
+    """Parses command-line arguments (so --help works without an API key)."""
     parser = argparse.ArgumentParser(
         description="Kimi Writing Agent - Create novels, books, and short stories",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -87,7 +85,18 @@ Examples:
         help='Path to a context summary file to continue from'
     )
     
-    args = parser.parse_args()
+    return parser.parse_args(argv)
+
+
+def get_user_input(args=None) -> tuple[str, bool, str | None]:
+    """
+    Gets user input from command line, either as a prompt or recovery file.
+    
+    Returns:
+        Tuple of (prompt/context, is_recovery_mode, recover_path)
+    """
+    if args is None:
+        args = parse_args()
     
     # Check if recovery mode
     if args.recover:
@@ -105,7 +114,11 @@ Examples:
     print("\nEnter your writing request (or 'quit' to exit):")
     print("Example: Create a collection of 15 sci-fi short stories\n")
     
-    prompt = input("> ").strip()
+    try:
+        prompt = input("> ").strip()
+    except EOFError:
+        print("\nError: No prompt given.")
+        sys.exit(1)
     
     if prompt.lower() in ['quit', 'exit', 'q']:
         print("Goodbye!")
@@ -173,6 +186,8 @@ def convert_message_for_api(msg: Any) -> Dict[str, Any]:
 def main():
     """Main agent loop."""
     
+    args = parse_args()
+
     # Get API key
     api_key = os.getenv("MOONSHOT_API_KEY")
     if not api_key:
@@ -196,7 +211,7 @@ def main():
     )
     
     # Get user input
-    user_prompt, is_recovery, recover_path = get_user_input()
+    user_prompt, is_recovery, recover_path = get_user_input(args)
     
     # Initialize message history
     messages = [
@@ -206,7 +221,8 @@ def main():
     if is_recovery:
         # Summary files live in the project folder: restore it as active
         project_dir = os.path.dirname(os.path.abspath(recover_path))
-        if os.path.basename(recover_path).startswith(".context_summary_") and os.path.isdir(project_dir):
+        if (os.path.basename(recover_path).startswith(".context_summary_")
+                and is_project_folder(project_dir)):
             set_active_project_folder(project_dir)
             print(f"✓ Active project folder: {project_dir}")
         messages.append({
@@ -236,6 +252,7 @@ def main():
     
     force_compress = False
     task_completed = False
+    consecutive_errors = 0
 
     # Main agent loop
     for iteration in range(1, MAX_ITERATIONS + 1):
@@ -246,31 +263,28 @@ def main():
         # Check token count before making API call
         try:
             token_count = estimate_token_count(base_url, api_key, MODEL_NAME, messages)
-            print(f"📊 Current tokens: {token_count:,}/{TOKEN_LIMIT:,} ({token_count/TOKEN_LIMIT*100:.1f}%)")
-            
-            # Trigger compression if approaching limit
-            if token_count >= COMPRESSION_THRESHOLD or force_compress:
-                force_compress = False
-                print(f"\n⚠️  Approaching token limit! Compressing context...")
+        except Exception as e:
+            token_count = rough_token_estimate(messages)
+            print(f"⚠️  Could not estimate token count ({e}); using rough estimate.")
+        print(f"📊 Current tokens: {token_count:,}/{TOKEN_LIMIT:,} ({token_count/TOKEN_LIMIT*100:.1f}%)")
+
+        # Trigger compression if approaching limit (or the model asked for it)
+        if token_count >= COMPRESSION_THRESHOLD or force_compress:
+            force_compress = False
+            print(f"\n⚠️  Approaching token limit! Compressing context...")
+            try:
                 compression_result = compress_context_impl(
                     messages=messages,
                     client=client,
                     model=MODEL_NAME,
                     keep_recent=10
                 )
-                
-                if "compressed_messages" in compression_result:
-                    messages = compression_result["compressed_messages"]
-                    print(f"✓ {compression_result['message']}")
+                messages = compression_result["compressed_messages"]
+                print(f"{'✓' if compression_result.get('summary_file') else '✗'} {compression_result['message']}")
+                if compression_result.get("summary_file"):
                     print(f"✓ Estimated tokens saved: ~{compression_result.get('tokens_saved', 0):,}")
-                    
-                    # Recalculate token count
-                    token_count = estimate_token_count(base_url, api_key, MODEL_NAME, messages)
-                    print(f"📊 New token count: {token_count:,}/{TOKEN_LIMIT:,}\n")
-        
-        except Exception as e:
-            print(f"⚠️  Warning: Could not estimate token count: {e}")
-            token_count = 0
+            except Exception as e:
+                print(f"⚠️  Compression failed: {e}")
         
         # Auto-backup every N iterations
         if iteration % BACKUP_INTERVAL == 0:
@@ -319,7 +333,8 @@ def main():
                     continue
                     
                 delta = chunk.choices[0].delta
-                finish_reason = chunk.choices[0].finish_reason
+                if chunk.choices[0].finish_reason:
+                    finish_reason = chunk.choices[0].finish_reason
                 
                 # Get role if present (first chunk)
                 if hasattr(delta, "role") and delta.role:
@@ -369,7 +384,7 @@ def main():
                             if reasoning_header_printed or content_header_printed:
                                 print("\n" + "=" * 60 + "\n")
                             
-                            if hasattr(tc_delta, "function") and tc_delta.function.name:
+                            if tc_delta.function and tc_delta.function.name:
                                 print(f"🔧 Preparing tool call: {tc_delta.function.name}")
                                 print("─" * 60)
                                 tool_call_header_printed = True
@@ -377,7 +392,7 @@ def main():
                         
                         if tc_delta.id:
                             tc["id"] = tc_delta.id
-                        if hasattr(tc_delta, "function"):
+                        if tc_delta.function:
                             if tc_delta.function.name:
                                 tc["function"]["name"] = tc_delta.function.name
                             if tc_delta.function.arguments:
@@ -413,6 +428,7 @@ def main():
             if tool_calls:
                 assistant_msg["tool_calls"] = tool_calls
             messages.append(assistant_msg)
+            consecutive_errors = 0
 
             if not tool_calls:
                 if finish_reason == "length":
@@ -451,9 +467,15 @@ def main():
             sys.exit(0)
         
         except Exception as e:
+            consecutive_errors += 1
             print(f"\n✗ Error during iteration {iteration}: {e}")
-            print(f"Attempting to continue...\n")
             fill_dangling_tool_calls(messages, f"error: {e}")
+            if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                print(f"✗ {consecutive_errors} errors in a row. Stopping. Fix the problem and use --recover.")
+                break
+            delay = min(2 ** consecutive_errors, 30)
+            print(f"Retrying in {delay}s...\n")
+            time.sleep(delay)
             continue
     
     # If we hit max iterations without finishing
